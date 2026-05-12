@@ -9,7 +9,7 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4        # ✅ Updated from v3 → v4 (Node.js 24)
         with:
           fetch-depth: 0
 
@@ -17,28 +17,50 @@ jobs:
         id: diff
         run: |
           git diff origin/${{ github.base_ref }}...HEAD > pr_diff.txt
+          echo "Diff size: $(wc -l < pr_diff.txt) lines"
 
-      - name: AI Review
+      - name: AI Review via Claude
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
         run: |
           DIFF=$(cat pr_diff.txt)
-          
+
+          # Skip if diff is empty
+          if [ -z "$DIFF" ]; then
+            echo "No diff found, skipping review."
+            exit 0
+          fi
+
+          # Call Claude API
           REVIEW=$(curl -s https://api.anthropic.com/v1/messages \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \
-            -d "{
-              \"model\": \"claude-sonnet-4-20250514\",
-              \"max_tokens\": 2048,
-              \"messages\": [{
-                \"role\": \"user\",
-                \"content\": \"Review this PR diff and provide feedback on bugs, security issues, code quality, and improvements:\n\n$DIFF\"
-              }]
-            }" | jq -r '.content[0].text')
-          
-          # Post review as PR comment
-          gh pr comment $PR_NUMBER --repo $REPO --body "$REVIEW"
+            -d "$(jq -n \
+              --arg diff "$DIFF" \
+              '{
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 2048,
+                messages: [{
+                  role: "user",
+                  content: ("You are a senior code reviewer. Review this PR diff and provide:\n1. 🐛 Bugs or logic errors\n2. 🔒 Security vulnerabilities\n3. ⚡ Performance concerns\n4. ✅ What looks good\n\nBe concise. Focus on critical issues.\n\nDiff:\n" + $diff)
+                }]
+              }'
+            )" | jq -r '.content[0].text')
+
+          echo "REVIEW<<EOF" >> $GITHUB_ENV
+          echo "$REVIEW" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Post Review as PR Comment
+        uses: actions/github-script@v7   # ✅ Updated to v7 (Node.js 24)
+        env:
+          REVIEW: ${{ env.REVIEW }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `## 🤖 Claude AI PR Review\n\n${process.env.REVIEW}`
+            });
